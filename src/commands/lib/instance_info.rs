@@ -67,6 +67,21 @@ pub fn get_instance_current_state(
         .and_then(|state| state.parse())
 }
 
+pub fn get_leader_id(picodata_path: &Path, instance_data_dir: &Path) -> Result<usize> {
+    let instance_socket = instance_data_dir.join("admin.sock");
+
+    get_lua_single_line_output(picodata_path, &instance_socket, GET_CLUSTER_LEADER_ID)
+        .and_then(|str| str.parse().context("failed to parse leader id from string"))
+        .map_err(|err| anyhow!("unable to get cluster leader id: {err}"))
+}
+
+pub fn get_online_instance_count(picodata_path: &Path, instance_socket: &Path) -> Result<u32> {
+    let stdout = run_query_in_picodata_admin(picodata_path, instance_socket, "SELECT COUNT(*) FROM _pico_instance WHERE CAST(current_state[1] AS string) = CAST(target_state[1] AS string) AND CAST(current_state[2] AS string) = CAST(target_state[2] AS string) AND CAST(current_state[1] as STRING) = 'Online';")?;
+    let stdout = stdout.trim();
+
+    Ok(stdout.parse()?)
+}
+
 pub fn get_cluster_leader_id(picodata_path: &Path, cluster_dir: &Path) -> Result<usize> {
     let Some(socket_path) = find_active_socket_path(cluster_dir)? else {
         bail!("failed to get cluster leader id information: no active socket found")

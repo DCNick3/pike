@@ -237,6 +237,8 @@ pub fn copy_directory_tree(src_path: &Path, dst_dir: &Path) -> Result<()> {
 pub fn spawn_picodata_admin(picodata_path: &Path, socket_path: &Path) -> Result<Child> {
     Command::new(picodata_path)
         .arg("admin")
+        // use the argument introduced in https://git.picodata.io/core/picodata/-/merge_requests/2657 (not yet merged)
+        .arg("-t")
         .arg(socket_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -251,34 +253,45 @@ pub fn run_query_in_picodata_admin(
     socket_path: &Path,
     query: &str,
 ) -> Result<String> {
-    let mut picodata_admin = spawn_picodata_admin(picodata_path, socket_path)?;
-    {
-        let picodata_stdin = picodata_admin.stdin.as_mut().unwrap();
-        picodata_stdin
-            .write_all(query.as_bytes())
-            .context("failed to send text in admin socket")?;
-    }
+    loop {
+        let mut picodata_admin = spawn_picodata_admin(picodata_path, socket_path)?;
+        {
+            let picodata_stdin = picodata_admin.stdin.as_mut().unwrap();
+            picodata_stdin
+                .write_all(query.as_bytes())
+                .context("failed to send text in admin socket")?;
+        }
 
-    let exit_code = picodata_admin
-        .wait()
-        .context("failed to wait for picodata admin")?;
+        let exit_code = picodata_admin
+            .wait()
+            .context("failed to wait for picodata admin")?;
 
-    if !exit_code.success() {
+        let mut stdout = String::new();
+        picodata_admin
+            .stdout
+            .unwrap()
+            .read_to_string(&mut stdout)
+            .context("failed to read stdout of picodata admin child")?;
+
         let mut stderr = String::new();
         picodata_admin
             .stderr
+            .as_mut()
             .unwrap()
             .read_to_string(&mut stderr)
             .context("failed to read stderr of picodata admin child")?;
-        bail!("failed to run query in picodata admin: {stderr}");
+
+        if exit_code.success() {
+            return Ok(stdout);
+        } else {
+            if stderr.contains("Connection refused (os error 111)")
+                || stderr.contains("No such file or directory (os error 2)")
+            {
+                // retry
+                continue;
+            } else {
+                bail!("failed to run query in picodata admin: {stderr}");
+            }
+        }
     }
-
-    let mut stdout = String::new();
-    picodata_admin
-        .stdout
-        .unwrap()
-        .read_to_string(&mut stdout)
-        .context("failed to read stdout of picodata admin child")?;
-
-    Ok(stdout)
 }

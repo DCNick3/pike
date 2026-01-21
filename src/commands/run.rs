@@ -1,3 +1,12 @@
+use crate::commands::lib::instance_info::{
+    get_cluster_leader_id, get_instance_current_state, get_instance_name,
+};
+use crate::commands::lib::{
+    cargo_build, copy_directory_tree, find_active_socket_path, get_cluster_dir, instance_info,
+    run_query_in_picodata_admin, spawn_picodata_admin, unpack_shipping_archive,
+};
+use crate::commands::lib::{get_active_socket_path, BuildType};
+use crate::commands::lib::{is_plugin_archive, is_plugin_dir, is_plugin_shipping_dir};
 use anyhow::{anyhow, bail, Context, Result};
 use colored::Colorize;
 use derive_builder::Builder;
@@ -5,7 +14,8 @@ use log::{error, info, warn};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use rand::Rng;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
 use serde_yaml::{Mapping, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -19,16 +29,6 @@ use std::str::{self};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
-
-use crate::commands::lib::instance_info::{
-    get_cluster_leader_id, get_instance_current_state, get_instance_name,
-};
-use crate::commands::lib::{
-    cargo_build, copy_directory_tree, find_active_socket_path, get_cluster_dir,
-    run_query_in_picodata_admin, spawn_picodata_admin, unpack_shipping_archive,
-};
-use crate::commands::lib::{get_active_socket_path, BuildType};
-use crate::commands::lib::{is_plugin_archive, is_plugin_dir, is_plugin_shipping_dir};
 
 const BAFFLED_WHALE: &str = r"
   __________________________________________________________
@@ -338,7 +338,7 @@ impl PicodataInstance {
         run_params: &Params,
     ) -> Result<Self> {
         // Properties
-        let mut instance_name = format!("i{instance_id}");
+        let instance_name = format!("i{instance_id}");
         let tiers_config = get_merged_cluster_tier_config(
             &run_params.plugin_path,
             &run_params.config_path,
@@ -446,35 +446,6 @@ impl PicodataInstance {
         let child = child
             .spawn()
             .context(format!("failed to start picodata instance: {instance_id}"))?;
-
-        let start = Instant::now();
-        while Instant::now().duration_since(start) < TIMEOUT_WAITING_FOR_INSTANCE_READINESS {
-            thread::sleep(Duration::from_millis(100));
-            let Ok(new_instance_name) =
-                get_instance_name(&run_params.picodata_path, &instance_data_dir)
-                    .inspect_err(|err| log::debug!("failed to get name of the instance: {err}"))
-            else {
-                continue;
-            };
-
-            // If name is already known, then socket is ready, i.e. we assume
-            // call below should return without error.
-            let instance_current_state =
-                get_instance_current_state(&run_params.picodata_path, &instance_data_dir)?;
-            if !instance_current_state.is_online() {
-                info!("Waiting for '{new_instance_name}' to become 'Online'");
-                continue;
-            }
-
-            // create symlink to real instance data dir
-            let symlink_name = cluster_dir.join(&new_instance_name);
-            let _ = fs::remove_file(&symlink_name);
-            symlink(&instance_name, symlink_name)
-                .context("failed create symlink to instance dir")?;
-
-            instance_name = new_instance_name;
-            break;
-        }
 
         let mut pico_instance = PicodataInstance {
             instance_name,
@@ -956,13 +927,6 @@ pub fn cluster(params: &Params) -> Result<Vec<PicodataInstance>> {
             "SKIPPED".yellow()
         );
         return Ok(vec![]);
-    } else if !run_single_instance {
-        if let Some(sock_path) = find_active_socket_path(&cluster_dir)? {
-            bail!(
-                "cluster has already started, can connect via {}",
-                sock_path.display()
-            );
-        }
     }
 
     let mut params = params.clone();
@@ -1068,8 +1032,6 @@ pub fn cluster(params: &Params) -> Result<Vec<PicodataInstance>> {
             "running picodata instance {instance_name} - {}",
             "OK".green()
         );
-
-        apply_web_auth_setting(&params, &cluster_dir)?;
     } else {
         let picodata_version = get_picodata_version(&params.picodata_path)?;
         info!("Running the cluster with {picodata_version}...");
@@ -1078,60 +1040,111 @@ pub fn cluster(params: &Params) -> Result<Vec<PicodataInstance>> {
         for (tier_name, tier) in &params.topology.tiers {
             for _ in 0..(tier.replicasets * tier.replication_factor) {
                 instance_id += 1;
-                let pico_instance =
-                    PicodataInstance::new(instance_id, plugins_dir.as_deref(), tier_name, &params)?;
 
-                picodata_processes.push(pico_instance);
+                let instance_name = format!("i{instance_id}");
+                if get_active_socket_path(&cluster_dir, &instance_name).is_none() {
+                    let pico_instance = PicodataInstance::new(
+                        instance_id,
+                        plugins_dir.as_deref(),
+                        tier_name,
+                        &params,
+                    )?;
 
-                info!("i{instance_id} - started");
+                    picodata_processes.push(pico_instance);
+
+                    info!("{instance_name} - started");
+                } else {
+                    info!("{instance_name} - SKIPPED");
+                }
             }
         }
 
-        // Check whether cluster leader is known at this point.
-        // If yes, just skip this step. Otherwise, try to resolve it through
-        // any available socket in the cluster.
-        {
-            let timeout = TIMEOUT_WAITING_FOR_CLUSTER_ID;
-            let start = Instant::now();
+        let start_cluster_wait = Instant::now();
+
+        info!("Waiting while all instances will become online");
+
+        let mut known_leaders_time = None;
+        let mut all_online_time = None;
+
+        let (known_leaders_time, all_online_time) = loop {
+            let mut leader_ids = Vec::new();
+            // FIXME: it would be nice to be able to do this in parallel
+            for instance in &picodata_processes {
+                let leader_id =
+                    instance_info::get_leader_id(&params.picodata_path, &instance.data_dir)
+                        .unwrap();
+                leader_ids.push(leader_id);
+            }
+            if leader_ids.iter().all(|&v| v != 0) && known_leaders_time.is_none() {
+                info!("Leaders are known!");
+                known_leaders_time = Some(Instant::now());
+            }
+
+            let current_instance_count = instance_info::get_online_instance_count(
+                &params.picodata_path,
+                &get_active_socket_path(&cluster_dir, "i1").unwrap(),
+            )
+            .unwrap();
+
+            if current_instance_count >= 85 && all_online_time.is_none() {
+                info!("All instances are online!");
+                all_online_time = Some(Instant::now());
+            }
+
+            if let (Some(known_leaders_time), Some(all_online_time)) =
+                (known_leaders_time, all_online_time)
+            {
+                break (known_leaders_time, all_online_time);
+            }
+
+            let leader_ids_vis = leader_ids
+                .iter()
+                .map(|&v| if v != 0 { "O" } else { "." })
+                .collect::<String>();
 
             info!(
-                "Waiting for cluster RAFT leader to be negotiated (timeout {}s)",
-                timeout.as_secs()
+                "still waiting... [{}] [{}]",
+                current_instance_count, leader_ids_vis
             );
+            // no need to sleep, checked leaders takes quite a long time already
+        };
 
-            while Instant::now().duration_since(start) < timeout {
-                let raft_leader_id = get_cluster_leader_id(&params.picodata_path, &cluster_dir)?;
+        let end_cluster_run = Instant::now();
 
-                if raft_leader_id != 0 {
-                    info!("Cluster leader id is {raft_leader_id}");
-                    break;
-                }
-
-                thread::sleep(Duration::from_millis(100));
-            }
+        #[derive(Debug, Serialize)]
+        struct Timings {
+            launch_time: f64,
+            wait_time: f64,
+            known_leaders_time: f64,
+            all_online_time: f64,
         }
 
-        apply_web_auth_setting(&params, &cluster_dir)?;
-        if !params.disable_plugin_install && !params.topology.plugins.is_empty() {
-            if plugins_dir.is_none() {
-                bail!("failed to enable plugins: directory with plugins is missing.")
-            }
-            info!("Enabling plugins...");
-            let result = enable_plugins(&params.topology, &cluster_dir, &params.picodata_path);
-            if let Err(e) = result {
-                for process in &mut picodata_processes {
-                    process.kill().unwrap_or_else(|e| {
-                        error!("failed to kill picodata instances: {e:#}");
-                    });
-                }
-                bail!("failed to enable plugins: {e}");
-            }
-        }
+        let timings = Timings {
+            launch_time: start_cluster_wait
+                .duration_since(start_cluster_run)
+                .as_secs_f64(),
+            wait_time: end_cluster_run
+                .duration_since(start_cluster_wait)
+                .as_secs_f64(),
+            known_leaders_time: known_leaders_time
+                .duration_since(start_cluster_wait)
+                .as_secs_f64(),
+            all_online_time: all_online_time
+                .duration_since(start_cluster_wait)
+                .as_secs_f64(),
+        };
 
-        info!(
-            "Picodata cluster has started (launch time: {} sec, total instances: {instance_id})",
-            start_cluster_run.elapsed().as_secs()
-        );
+        info!("Picodata cluster has started\n{:#?}", timings);
+
+        let mut timings_oneline = serde_json::to_string(&timings).unwrap();
+        timings_oneline.push_str("\n");
+        File::options()
+            .append(true)
+            .create(true)
+            .open("timings.json")
+            .unwrap()
+            .write_all(timings_oneline.as_bytes())
+            .unwrap();
     }
 
     Ok(picodata_processes)
@@ -1151,14 +1164,25 @@ pub fn cmd(params: &Params) -> Result<()> {
     // All instances would be killed, then joined and
     // destructors will be called
     let picodata_pids: Vec<u32> = pico_instances.iter().map(|p| p.child.id()).collect();
-    ctrlc::set_handler(move || {
-        info!("received Ctrl+C. Shutting down ...");
 
+    if params.instance_name.is_none() {
+        // HACK: stop the whole cluster right after we have finished starting it
+        // this simplifies testing
+        info!("Shutting the cluster down...");
         for &pid in &picodata_pids {
-            let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
+            // make sure to call SIGTERM instead of SIGKILL for a graceful shutdown
+            let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
         }
-    })
-    .context("failed to set Ctrl+c handler")?;
+    } else {
+        ctrlc::set_handler(move || {
+            info!("received Ctrl+C. Shutting down ...");
+
+            for &pid in &picodata_pids {
+                let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
+            }
+        })
+        .context("failed to set Ctrl+C handler")?;
+    }
 
     // Wait for all instances to stop
     for instance in &mut pico_instances {
