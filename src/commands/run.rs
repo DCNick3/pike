@@ -443,6 +443,11 @@ impl PicodataInstance {
             child.args(["--audit", audit_file_path.to_str().expect("unreachable")]);
         }
 
+        child.env(
+            "PICODATA_ERROR_INJECTION_MIN_HEARTBEAT_PERIOD_MS",
+            &run_params.min_heartbeat_period,
+        );
+
         let child = child
             .spawn()
             .context(format!("failed to start picodata instance: {instance_id}"))?;
@@ -856,6 +861,9 @@ pub struct Params {
     with_web_auth: bool,
     #[builder(default = "false")]
     with_audit: bool,
+    launch_name: String,
+    min_heartbeat_period: String,
+    full_instance_count: u32,
 }
 
 impl Params {
@@ -1086,7 +1094,7 @@ pub fn cluster(params: &Params) -> Result<Vec<PicodataInstance>> {
             )
             .unwrap();
 
-            if current_instance_count >= 85 && all_online_time.is_none() {
+            if current_instance_count >= params.full_instance_count && all_online_time.is_none() {
                 info!("All instances are online!");
                 all_online_time = Some(Instant::now());
             }
@@ -1113,6 +1121,7 @@ pub fn cluster(params: &Params) -> Result<Vec<PicodataInstance>> {
 
         #[derive(Debug, Serialize)]
         struct Timings {
+            launch_name: String,
             launch_time: f64,
             wait_time: f64,
             known_leaders_time: f64,
@@ -1120,6 +1129,7 @@ pub fn cluster(params: &Params) -> Result<Vec<PicodataInstance>> {
         }
 
         let timings = Timings {
+            launch_name: params.launch_name,
             launch_time: start_cluster_wait
                 .duration_since(start_cluster_run)
                 .as_secs_f64(),

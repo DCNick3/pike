@@ -129,6 +129,12 @@ enum Command {
         /// named `audit.log` within its respective instance directory.
         #[arg(long, value_name = "WITH_AUDIT", default_value_t = false)]
         with_audit: bool,
+        #[arg(long)]
+        launch_name: String,
+        #[arg(long)]
+        min_heartbeat_period: String,
+        #[arg(long)]
+        full_instance_count: u32,
     },
     /// Stop Picodata cluster or a specific instance
     Stop {
@@ -381,6 +387,9 @@ fn main() -> Result<()> {
             instance_name,
             with_web_auth,
             with_audit,
+            launch_name,
+            min_heartbeat_period,
+            full_instance_count,
         } => {
             is_required_path_exists(&plugin_path, &topology, CARING_PIKE, 1);
 
@@ -408,6 +417,9 @@ fn main() -> Result<()> {
                 .instance_name(instance_name)
                 .with_web_auth(with_web_auth)
                 .with_audit(with_audit)
+                .launch_name(launch_name)
+                .min_heartbeat_period(min_heartbeat_period)
+                .full_instance_count(full_instance_count)
                 .build()
                 .unwrap();
             commands::run::cmd(&params).context("failed to execute Run command")?;
